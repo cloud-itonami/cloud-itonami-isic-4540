@@ -1,0 +1,11 @@
+{:itonami.blueprint/id "cloud-itonami-4540"
+ :itonami.blueprint/name "Community Motorcycle Sale & Repair Operations"
+ :itonami.blueprint/isic-rev5 "4540"
+ :itonami.blueprint/domain :commercial/motorcycle-sale-repair-services
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:road-safety :consumer-protection :small-business-support]
+ :itonami.blueprint/governor :motorcycle-ops-governor
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :retail]
+ :itonami.blueprint/optional-technologies []
+ :itonami.blueprint/status :public-oss}

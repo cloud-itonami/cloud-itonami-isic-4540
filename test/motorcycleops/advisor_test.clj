@@ -1,0 +1,62 @@
+(ns motorcycleops.advisor-test
+  "Unit tests of `motorcycleops.advisor` proposal generation."
+  (:require [clojure.test :refer [deftest is testing]]
+            [motorcycleops.advisor :as adv]
+            [motorcycleops.store :as store]))
+
+(def db (store/seed-db))
+
+(deftest propose-service-record-shape
+  (testing "service-record proposal has correct shape and fields"
+    (let [p (adv/infer db {:op :log-service-record
+                           :account-id "account-1"
+                           :patch {:motorcycle-id "MC-00042" :order-type :repair}})]
+      (is (= :log-service-record (:op p)))
+      (is (= "account-1" (:account-id p)))
+      (is (= :propose (:effect p)))
+      (is (<= 0 (:confidence p) 1))
+      (is (map? (:value p)))
+      (is (contains? (:value p) :account-id)))))
+
+(deftest propose-service-operation-shape
+  (testing "service-operation proposal has correct shape"
+    (let [p (adv/infer db {:op :schedule-service-operation
+                           :account-id "account-2"
+                           :patch {:bay "bay-2" :technician "tech-7"}})]
+      (is (= :schedule-service-operation (:op p)))
+      (is (= "account-2" (:account-id p)))
+      (is (= :propose (:effect p))))))
+
+(deftest propose-safety-concern-shape
+  (testing "safety-concern proposal has correct shape"
+    (let [p (adv/infer db {:op :flag-safety-concern
+                           :account-id "account-1"
+                           :patch {:concern "possible brake-lever play"}})]
+      (is (= :flag-safety-concern (:op p)))
+      (is (= :propose (:effect p)))
+      (is (string? (:summary p))))))
+
+(deftest propose-parts-order-shape
+  (testing "parts-order proposal has correct shape"
+    (let [p (adv/infer db {:op :coordinate-parts-order
+                           :account-id "account-1"
+                           :patch {:supplier "Kanda Moto Parts" :part "chain-and-sprocket-kit"}})]
+      (is (= :coordinate-parts-order (:op p)))
+      (is (= :propose (:effect p)))
+      (is (>= (:confidence p) 0.85)))))
+
+(deftest all-proposals-effect-is-always-propose
+  (testing "every proposal type has :effect :propose, never direct actuation"
+    (doseq [op [:log-service-record :schedule-service-operation
+                :flag-safety-concern :coordinate-parts-order]]
+      (let [p (adv/infer db {:op op :account-id "account-1" :patch {}})]
+        (is (= :propose (:effect p))
+            (str "op " op " must have :effect :propose"))))))
+
+(deftest rationale-string-is-present
+  (testing "every proposal has a rationale explaining the advisor's thinking"
+    (doseq [op [:log-service-record :schedule-service-operation
+                :flag-safety-concern :coordinate-parts-order]]
+      (let [p (adv/infer db {:op op :account-id "account-1" :patch {}})]
+        (is (string? (:rationale p))
+            (str "op " op " must have a :rationale string"))))))

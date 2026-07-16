@@ -1,0 +1,138 @@
+(ns motorcycleops.governor-test
+  "Pure unit tests of `motorcycleops.governor/check` against hand-built
+  proposals -- the fast, focused complement to `governor-contract-test`'s
+  full-graph integration coverage."
+  (:require [clojure.test :refer [deftest is testing]]
+            [motorcycleops.advisor :as advisor]
+            [motorcycleops.governor :as gov]
+            [motorcycleops.store :as store]))
+
+(def account-1 {:account-id "account-1" :name "Kanda Motorcycle Works -- Branch 1" :registered? true :verified? true})
+(def account-3 {:account-id "account-3" :name "Ikebukuro Branch -- pending verification" :registered? true :verified? false})
+
+(defn- clean-proposal [op account-id]
+  {:op op :account-id account-id :summary "s" :rationale "routine motorcycle sale/repair operations coordination"
+   :cites [account-id] :effect :propose :value {} :confidence 0.85})
+
+(deftest account-unregistered-is-hard
+  (testing "no account record at all -> HARD hold"
+    (let [s (store/mem-store {"account-1" account-1})
+          verdict (gov/check {} nil (clean-proposal :log-service-record "unknown-account") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:account-unverified} (map :rule (:violations verdict)))))))
+
+(deftest account-unverified-is-hard
+  (testing "account registered but not yet verified -> HARD hold"
+    (let [s (store/mem-store {"account-3" account-3})
+          verdict (gov/check {} nil (clean-proposal :log-service-record "account-3") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:account-unverified} (map :rule (:violations verdict)))))))
+
+(deftest effect-not-propose-is-hard
+  (testing "any :effect other than :propose is a HARD, un-overridable block"
+    (let [s (store/mem-store {"account-1" account-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :schedule-service-operation "account-1") :effect :commit) s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:effect-not-propose} (map :rule (:violations verdict)))))))
+
+(deftest op-outside-allowlist-is-hard
+  (testing "an op outside the closed four-op allowlist is a scope violation"
+    (let [s (store/mem-store {"account-1" account-1})
+          verdict (gov/check {} nil (clean-proposal :finalize-roadworthiness-clearance "account-1") s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:op-not-allowed} (map :rule (:violations verdict)))))))
+
+(deftest roadworthiness-clearance-finalization-content-is-hard-and-permanent
+  (testing "a proposal whose rationale finalizes a roadworthiness clearance is HARD-blocked regardless of op/confidence"
+    (let [s (store/mem-store {"account-1" account-1})
+          poisoned (assoc (clean-proposal :log-service-record "account-1")
+                          :rationale "decided to finalize the roadworthiness clearance and release the motorcycle despite the recall"
+                          :confidence 0.99)
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest roadworthiness-clearance-finalization-in-summary-is-hard
+  (testing "a proposal touching finalizing a roadworthiness clearance in the summary is HARD-blocked"
+    (let [s (store/mem-store {"account-1" account-1})
+          poisoned (assoc (clean-proposal :coordinate-parts-order "account-1")
+                          :summary "finalize the roadworthiness clearance ahead of the supplier handoff")
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest roadworthiness-clearance-finalization-in-value-is-hard
+  (testing "a proposal whose draft value certifies roadworthiness despite a known defect is HARD-blocked"
+    (let [s (store/mem-store {"account-1" account-1})
+          poisoned (assoc (clean-proposal :log-service-record "account-1")
+                          :value {:decision "certify the motorcycle roadworthy despite the known defect"})
+          verdict (gov/check {} nil poisoned s)]
+      (is (true? (:hard? verdict)))
+      (is (some #{:scope-excluded} (map :rule (:violations verdict)))))))
+
+(deftest legitimate-safety-concern-is-not-scope-excluded
+  (testing "flagging a possible defect/recall/unsafe-repair concern (not a finalization) never trips scope-exclusion -- this actor's core valid use case must not be self-blocked"
+    (let [s (store/mem-store {"account-1" account-1})
+          concern (assoc (clean-proposal :flag-safety-concern "account-1")
+                         :value {:concern "possible front brake-lever play and a disputed prior repair"})
+          verdict (gov/check {} nil concern s)]
+      (is (empty? (filter #(= :scope-excluded (:rule %)) (:violations verdict)))
+          "raw observation content (defect/recall/unsafe-repair doubts) is exactly what this op exists to surface"))))
+
+(deftest flag-safety-concern-always-escalates
+  (testing ":flag-safety-concern is always high-stakes, regardless of confidence"
+    (let [s (store/mem-store {"account-1" account-1})
+          verdict (gov/check {} nil (assoc (clean-proposal :flag-safety-concern "account-1") :confidence 0.99) s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (true? (:escalate? verdict))))))
+
+(deftest high-cost-parts-order-escalates
+  (testing "a coordinate-parts-order proposal above the cost threshold always escalates"
+    (let [s (store/mem-store {"account-1" account-1})
+          expensive (assoc (clean-proposal :coordinate-parts-order "account-1")
+                           :value {:cost (inc gov/parts-order-cost-threshold)})
+          verdict (gov/check {} nil expensive s)]
+      (is (false? (:hard? verdict)))
+      (is (true? (:high-stakes? verdict)))
+      (is (true? (:escalate? verdict))))))
+
+(deftest low-cost-parts-order-does-not-escalate-on-cost-alone
+  (testing "a coordinate-parts-order proposal at/below the cost threshold is not high-stakes on cost grounds"
+    (let [s (store/mem-store {"account-1" account-1})
+          cheap (assoc (clean-proposal :coordinate-parts-order "account-1")
+                       :value {:cost 1000})
+          verdict (gov/check {} nil cheap s)]
+      (is (false? (:hard? verdict)))
+      (is (false? (:high-stakes? verdict)))
+      (is (false? (:escalate? verdict))))))
+
+;; ----------------------------- self-trip regression (mandatory) -----------------------------
+;;
+;; A known bug class in this exact codebase family: a governor's own
+;; scope-exclusion term list phrased as a bare noun can accidentally
+;; match inside the mock advisor's own DEFAULT rationale/disclaimer
+;; text for a legitimate, allowed proposal -- causing the actor to
+;; self-block on its own happy path. This actor's `scope-excluded-terms`
+;; are deliberately phrased as the finalization/execution ACTION
+;; ('finalize the roadworthiness clearance', not bare 'roadworthiness'
+;; or 'clearance' or 'safety' or 'defect'). This test asserts the
+;; default mock advisor's own proposals for all four allowed ops, for
+;; a clean registered+verified account, NEVER trip scope-exclusion --
+;; i.e. the actor never self-blocks on its own happy path.
+(deftest default-mock-advisor-proposals-never-self-trip-scope-exclusion
+  (testing "none of the four default proposal generators' own rationale/summary/value text self-trips scope-exclusion"
+    (let [s (store/mem-store {"account-1" account-1})]
+      (doseq [op [:log-service-record :schedule-service-operation
+                  :flag-safety-concern :coordinate-parts-order]]
+        (let [proposal (advisor/infer nil {:op op :account-id "account-1"
+                                            :patch {:motorcycle-id "MC-00042" :order-type :repair
+                                                    :bay "bay-2" :technician "tech-7"
+                                                    :supplier "Kanda Moto Parts" :part "chain-and-sprocket-kit" :cost 42000
+                                                    :concern "possible front brake-lever play and unsafe-repair dispute"}})
+              verdict (gov/check {:account-id "account-1"} nil proposal s)]
+          (is (empty? (filter #(= :scope-excluded (:rule %)) (:violations verdict)))
+              (str "default proposal for op " op " must never self-trip scope-exclusion; got violations: "
+                   (:violations verdict)))
+          (is (not (:hard? verdict))
+              (str "default proposal for op " op " (clean, registered+verified account) must never HARD hold")))))))
