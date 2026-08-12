@@ -1,0 +1,519 @@
+(ns motorcycleops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2: this repo previously had NO demo
+  console and no generator at all. This namespace drives the REAL
+  MotorcycleOpsOperationActor (`motorcycleops.operation/build` -> a
+  compiled langgraph-clj StateGraph) over the REAL seeded store
+  (`motorcycleops.store/seed-db`), through the REAL MotorcycleOps
+  Governor (`motorcycleops.governor/check`) and the REAL rollout phase
+  gate (`motorcycleops.phase/gate`), and renders whatever those
+  produced. Nothing on the page is written by hand:
+
+    - the account directory table is read back out of the store
+      (`store/all-accounts`) after the run,
+    - every ledger row is a `store/ledger` fact, and every HARD-hold
+      rule name and violation detail string is the governor's OWN
+      `:violations` entry off that fact -- never a literal here,
+    - the committed service log is `store/service-log`, including which
+      records carry a human `:approved-by` on their payload,
+    - the rollout-phase table is derived from `motorcycleops.phase/
+      phases`, and the governor-configuration table from
+      `motorcycleops.governor`'s public vars (`confidence-floor`,
+      `parts-order-cost-threshold`, `allowed-ops`,
+      `always-escalate-ops`, `scope-excluded-terms`).
+
+  Subject provenance (the demo may not invent accounts): every
+  `:account-id` driven below is seeded by `store/demo-data`
+  (`account-1` `account-2` = registered AND verified, `account-3` =
+  registered but NOT yet verified) EXCEPT `account-99`, which is
+  deliberately absent from the directory -- it is the unregistered-
+  account probe this repo's own `motorcycleops.sim` uses, and exists
+  solely so the governor's `account-unverified` HARD check can be shown
+  firing on a genuinely unknown account. It is labelled as such on the
+  page. No operator, company, motorcycle or figure appears here that
+  the repo's own seed data or the actor's own output did not produce.
+
+  Coverage: the scenario exercises ALL FOUR of the governor's HARD
+  rules (`:account-unverified`, `:effect-not-propose`, `:op-not-allowed`,
+  `:scope-excluded`), BOTH phase-gate hold/escalate reasons
+  (`:phase-disabled`, `:phase-approval`), both always-escalate paths
+  (`:flag-safety-concern` at any phase, and a `:coordinate-parts-order`
+  over `parts-order-cost-threshold`), and a human REJECTION
+  (`:approval-rejected`) -- so the page cannot show a governor that only
+  ever says yes.
+
+  Deterministic: no clock, no randomness, no network, and every map/set
+  rendered is sorted before it is written, so hash iteration order can
+  never leak into the bytes. Re-running writes a byte-identical file.
+
+  Run: `clojure -M:dev:render-html [out-file]`
+  (default out-file `docs/samples/operator-console.html`)."
+  (:require [clojure.string :as str]
+            [jp-go-dds.skin]
+            [langgraph.graph :as g]
+            [motorcycleops.advisor :as advisor]
+            [motorcycleops.governor :as governor]
+            [motorcycleops.operation :as op]
+            [motorcycleops.phase :as phase]
+            [motorcycleops.store :as store]))
+
+;; ----------------------------- the run -----------------------------
+
+(def ^:private coordinator-id "coord-1")
+
+(def ^:private approver
+  "The human workshop coordinator who resumes a paused actor run. Same
+  approver identity this repo's own `motorcycleops.sim` uses."
+  "workshop-coordinator-1")
+
+(defn- context-for [phase]
+  {:actor-id coordinator-id :actor-role :workshop-coordinator :phase phase})
+
+(def ^:private effect-drift-advisor
+  "A deliberately misbehaving advisor that keeps its proposal otherwise
+  intact but claims `:effect :commit` -- i.e. a direct actuation
+  outside governance. Exercises the governor's `:effect-not-propose`
+  HARD check end to end (same injection this repo's `sim` uses)."
+  (reify advisor/Advisor
+    (-advise [_ _ request]
+      (assoc (advisor/infer nil request) :effect :commit))))
+
+(def ^:private op-drift-advisor
+  "A deliberately misbehaving advisor that answers a legitimate
+  `:log-service-record` request with a proposal for an op that is NOT
+  in the governor's closed allowlist. Exercises the `:op-not-allowed`
+  HARD check -- the governor reads the op off the PROPOSAL, never off
+  the request, precisely so this drift is visible."
+  (reify advisor/Advisor
+    (-advise [_ _ request]
+      (assoc (advisor/infer nil request) :op :finalize-roadworthiness-clearance))))
+
+(def ^:private scenarios
+  "One entry = one coordination request driven through the real actor.
+  `:approval`, when present, is the human decision handed back to the
+  graph paused by `interrupt-before #{:request-approval}`. `:advisor`,
+  when present, swaps the contained intelligence node for a drifting
+  one so a HARD check can be observed firing."
+  [{:thread "t01" :phase 3
+    :note "clean logging at supervised-auto phase"
+    :request {:op :log-service-record :account-id "account-1"
+              :patch {:motorcycle-id "MC-00042" :order-type :repair
+                      :parts-used ["brake-pad-set"]}}}
+
+   {:thread "t02" :phase 3
+    :note "clean bay/technician scheduling at supervised-auto phase"
+    :request {:op :schedule-service-operation :account-id "account-1"
+              :patch {:bay "bay-2" :technician "tech-7" :window "2026-07-20T09:00"}}}
+
+   {:thread "t03" :phase 3
+    :note "parts order under the cost threshold"
+    :request {:op :coordinate-parts-order :account-id "account-2"
+              :patch {:supplier "Kanda Moto Parts" :part "chain-and-sprocket-kit"
+                      :cost 42000}}}
+
+   {:thread "t04" :phase 3
+    :note "parts order OVER the cost threshold -- always escalates"
+    :request {:op :coordinate-parts-order :account-id "account-2"
+              :patch {:supplier "Kanda Moto Parts" :part "replacement-engine-block"
+                      :cost 480000}}
+    :approval {:status :approved :by approver}}
+
+   {:thread "t05" :phase 3
+    :note "safety-concern flag -- never auto-commits at any phase"
+    :request {:op :flag-safety-concern :account-id "account-1"
+              :patch {:concern "front brake lever play reported by customer at pickup"
+                      :confidence 0.9}}
+    :approval {:status :approved :by approver}}
+
+   {:thread "t06" :phase 1
+    :note "logging is enabled at assisted-logging phase, but never auto"
+    :request {:op :log-service-record :account-id "account-2"
+              :patch {:motorcycle-id "MC-00099" :order-type :sale :price 890000}}
+    :approval {:status :approved :by approver}}
+
+   {:thread "t07" :phase 1
+    :note "scheduling is not yet enabled at assisted-logging phase"
+    :request {:op :schedule-service-operation :account-id "account-2"
+              :patch {:bay "bay-1" :technician "tech-3" :window "2026-07-21T13:00"}}}
+
+   {:thread "t08" :phase 3
+    :note "account registered but NOT yet verified"
+    :request {:op :log-service-record :account-id "account-3"
+              :patch {:motorcycle-id "MC-00012"}}}
+
+   {:thread "t09" :phase 3
+    :note "account absent from the directory entirely"
+    :request {:op :log-service-record :account-id "account-99"
+              :patch {:motorcycle-id "MC-00007"}}}
+
+   {:thread "t10" :phase 3 :advisor effect-drift-advisor
+    :note "advisor claims a direct actuation instead of a proposal"
+    :request {:op :schedule-service-operation :account-id "account-1"
+              :patch {:bay "bay-4" :technician "tech-2"}}}
+
+   {:thread "t11" :phase 3 :advisor op-drift-advisor
+    :note "advisor proposes an op outside the closed allowlist"
+    :request {:op :log-service-record :account-id "account-1"
+              :patch {:motorcycle-id "MC-00201"}}}
+
+   {:thread "t12" :phase 3
+    :note "advisor drifts into roadworthiness-clearance finalization"
+    :request {:op :log-service-record :account-id "account-1" :out-of-scope? true
+              :patch {:motorcycle-id "MC-00311"}}}
+
+   {:thread "t13" :phase 3
+    :note "escalated safety concern the human REJECTS"
+    :request {:op :flag-safety-concern :account-id "account-2"
+              :patch {:concern "rear shock absorber leak observed during pre-delivery inspection"
+                      :confidence 0.88}}
+    :approval {:status :rejected :by approver}}])
+
+(defn- run-scenario!
+  "Drives one scenario through `actor` and returns the scenario plus the
+  final graph result (post-approval when the run escalated)."
+  [actor {:keys [thread phase request approval] :as scenario}]
+  (let [r0 (g/run* actor {:request request :context (context-for phase)}
+                   {:thread-id thread})
+        r  (if approval
+             (g/run* actor {:approval approval} {:thread-id thread :resume? true})
+             r0)]
+    (assoc scenario :result r)))
+
+(defn run-demo!
+  "Runs every scenario above through the real actor against one freshly
+  seeded store. Returns {:db store :runs [scenario+result ..]} -- every
+  field the renderer reads is real governor/store output."
+  []
+  (let [db    (store/seed-db)
+        base  (op/build db)
+        runs  (mapv (fn [{:keys [advisor] :as sc}]
+                      (run-scenario! (if advisor (op/build db {:advisor advisor}) base) sc))
+                    scenarios)]
+    {:db db :runs runs}))
+
+;; ----------------------------- formatting helpers -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")
+      (str/replace "\"" "&quot;")))
+
+(defn- nm [x] (if (keyword? x) (name x) (str x)))
+
+(def ^:private dash "<span class=\"muted\">—</span>")
+
+(defn- join-names
+  "Sorted, comma-joined names -- sorting is what keeps set iteration
+  order out of the rendered bytes."
+  [xs]
+  (if (seq xs)
+    (str/join ", " (sort (map nm xs)))
+    nil))
+
+(defn- code-list [xs]
+  (if-let [ks (seq (sort (map nm xs)))]
+    (str/join " " (map #(str "<code>" (esc %) "</code>") ks))
+    dash))
+
+(defn- kv-str
+  "A map rendered as sorted `key value` pairs -- never `pr-str` of the
+  map itself, so hash-map iteration order can never reach the page."
+  [m]
+  (if (seq m)
+    (str/join ", " (for [[k v] (sort-by (comp str key) m)]
+                     (str (nm k) " " (pr-str v))))
+    nil))
+
+(defn- yes-no [b]
+  (if b "<span class=\"ok\">yes</span>" "<span class=\"critical\">no</span>"))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- facts-for [ledger account-id]
+  (filterv #(= account-id (:account-id %)) ledger))
+
+(defn- account-row [ledger {:keys [account-id name registered? verified?]}]
+  (let [fs (facts-for ledger account-id)
+        commits (count (filter #(= :committed (:t %)) fs))
+        holds   (count (filter #(#{:governor-hold :approval-rejected} (:t %)) fs))]
+    (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td></tr>"
+            (esc account-id) (esc name) (yes-no registered?) (yes-no verified?)
+            commits
+            (if (pos? holds) (str "<span class=\"critical\">" holds "</span>") "0"))))
+
+(defn- phase-row [default-phase [p {:keys [label writes auto]}]]
+  (format "        <tr><td class=\"num\">%s%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+          p
+          (if (= p default-phase) " <span class=\"badge\">default</span>" "")
+          (esc label)
+          (code-list writes)
+          (code-list auto)))
+
+(defn- governor-config-rows []
+  (let [rows [["confidence floor (below this, escalate)"
+               (str "<span class=\"num\">" governor/confidence-floor "</span>")]
+              ["parts-order cost threshold (above this, ALWAYS escalate)"
+               (str "<span class=\"num\">" governor/parts-order-cost-threshold "</span>")]
+              ["proposal ops (closed allowlist)" (code-list governor/allowed-ops)]
+              ["ops that ALWAYS need a human, clean or not"
+               (code-list governor/always-escalate-ops)]
+              ["scope-exclusion patterns (roadworthiness-clearance finalization)"
+               (str "<span class=\"num\">" (count governor/scope-excluded-terms)
+                    "</span> phrases, HARD &amp; permanent")]]]
+    (for [[k v] rows]
+      (format "        <tr><td>%s</td><td>%s</td></tr>" (esc k) v))))
+
+(defn- verdict-cell [{:keys [ok? hard? escalate? high-stakes? violations confidence]}]
+  (cond
+    hard? (str "<span class=\"critical\">HARD · "
+               (esc (or (join-names (map :rule violations)) "violation")) "</span>")
+    escalate? (str "<span class=\"warn\">escalate · "
+                   (if high-stakes? "high-stakes" "low-confidence") "</span>")
+    ok? "<span class=\"ok\">clean</span>"
+    :else (str "<span class=\"muted\">confidence " (esc confidence) "</span>")))
+
+(defn- human-cell
+  "The human step, plus WHY a human was asked at all. The reason is the
+  `:reason` the actor's own `:decide` node put on its
+  `:approval-requested` fact -- `:phase-approval` when the rollout
+  phase gate demanded a human even though the governor was clean,
+  `:always-escalate`/`:low-confidence` when the governor itself did.
+  It is read off the run's audit, never inferred here: this is the
+  only place the phase gate's escalate reason is visible, since the
+  ledger records outcomes and not escalation requests."
+  [audit]
+  (let [granted  (some #(when (= :approval-granted (:t %)) %) audit)
+        rejected (some #(when (= :approval-rejected (:t %)) %) audit)
+        asked    (some #(when (= :approval-requested (:t %)) %) audit)
+        why      (when-let [r (:reason asked)]
+                   (str " <span class=\"muted\">&middot; asked because <code>"
+                        (esc (nm r)) "</code></span>"))]
+    (cond
+      granted  (str "<span class=\"ok\">approved</span> by <code>"
+                    (esc (:by granted)) "</code>" why)
+      rejected (str "<span class=\"critical\">rejected</span>" why)
+      asked    (str "<span class=\"warn\">awaiting approval</span>" why)
+      :else    dash)))
+
+(defn- final-cell [disposition audit]
+  (let [hold (some #(when (#{:governor-hold :approval-rejected} (:t %)) %) audit)
+        reason (:phase-reason hold)]
+    (case disposition
+      :commit "<span class=\"ok\">committed</span>"
+      :hold (str "<span class=\"critical\">HOLD</span>"
+                 (when reason (str " <span class=\"muted\">· " (esc (nm reason)) "</span>")))
+      :escalate "<span class=\"warn\">escalated, undecided</span>"
+      (str "<span class=\"muted\">" (esc disposition) "</span>"))))
+
+(defn- run-row [{:keys [thread phase note request result]}]
+  (let [state (:state result)
+        {:keys [verdict disposition audit proposal]} state]
+    (format "        <tr><td><code>%s</code></td><td class=\"num\">%s</td><td><code>%s</code></td><td><code>%s</code></td><td class=\"num\">%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"muted\">%s</td></tr>"
+            (esc thread) phase
+            (esc (nm (:op request)))
+            (esc (:account-id request))
+            (esc (or (:confidence proposal) "—"))
+            (verdict-cell verdict)
+            (human-cell audit)
+            (final-cell disposition audit)
+            (esc note))))
+
+(defn- ledger-detail [{:keys [t violations summary]}]
+  (cond
+    (seq violations)
+    (or (some->> violations (keep :detail) seq (str/join " / ") esc)
+        (str "<span class=\"muted\">" (esc (join-names (map :rule violations))) "</span>"))
+    (= :committed t) (esc summary)
+    :else dash))
+
+(defn- ledger-row [i {:keys [t op account-id basis phase-reason phase] :as f}]
+  (format "        <tr><td class=\"num\">%s</td><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          i
+          (case t
+            :committed "<span class=\"ok\">committed</span>"
+            :governor-hold "<span class=\"critical\">governor-hold</span>"
+            :approval-rejected "<span class=\"critical\">approval-rejected</span>"
+            (str "<span class=\"muted\">" (esc (nm t)) "</span>"))
+          (esc (nm op))
+          (esc account-id)
+          (or (some-> (join-names basis) esc)
+              (when phase-reason
+                (str "<code>" (esc (nm phase-reason)) "</code> <span class=\"muted\">(phase "
+                     (esc phase) ")</span>"))
+              dash)
+          (ledger-detail f)))
+
+(defn- service-row [i {:keys [op account-id value payload]}]
+  (format "        <tr><td class=\"num\">%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+          i (esc (nm op)) (esc account-id)
+          (esc (or (kv-str value) "—"))
+          (if-let [by (:approved-by payload)]
+            (str "<code>" (esc by) "</code>")
+            "<span class=\"muted\">auto-commit</span>")))
+
+;; ----------------------------- document -----------------------------
+
+(defn render
+  "Renders the whole operator-console document from the result of
+  `run-demo!`. Every number below is counted off the real ledger."
+  [{:keys [db runs]}]
+  (let [ledger   (vec (store/ledger db))
+        svc      (vec (store/service-log db))
+        holds    (filterv #(= :governor-hold (:t %)) ledger)
+        rejected (filterv #(= :approval-rejected (:t %)) ledger)
+        commits  (filterv #(= :committed (:t %)) ledger)
+        hold-rules (sort (distinct (mapcat #(map :rule (:violations %)) holds)))]
+    (str
+     "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+     "<meta name=\"color-scheme\" content=\"light\">"
+     "<title>cloud-itonami-isic-4540 · motorcycle sale &amp; repair operations — Operator Console</title>"
+     "<style>" (jp-go-dds.skin/dds+skin) "</style></head><body>\n"
+
+     "<header class=\"bar\">\n"
+     "  <h1>Community Motorcycle Sale &amp; Repair Operations (ISIC 4540) — Operator Console</h1>\n"
+     "</header>\n"
+     "<p class=\"subtitle\"><span class=\"badge\">read-only sample</span> "
+     "<span class=\"badge\">governor-gated</span> "
+     "<span class=\"badge\">roadworthiness clearance NEVER finalized here</span></p>\n"
+
+     "<main>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>This run</h2>\n"
+     "    <p class=\"muted\">Build-time-generated by <code>motorcycleops.render-html</code> "
+     "(<code>clojure -M:dev:render-html</code>) by driving the real "
+     "<code>motorcycleops.operation</code> actor &rarr; <code>motorcycleops.governor</code> "
+     "&rarr; <code>motorcycleops.store</code>. No value on this page is hand-written; "
+     "re-running produces a byte-identical file.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Actor runs</th><th>Ledger facts</th><th>Committed</th>"
+     "<th>HARD governor holds</th><th>Human rejections</th><th>Distinct hold rules</th></tr></thead>\n"
+     "      <tbody>\n"
+     (format "        <tr><td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\">%s</td><td class=\"num\"><span class=\"critical\">%s</span></td><td class=\"num\">%s</td><td>%s</td></tr>"
+             (count runs) (count ledger) (count commits) (count holds) (count rejected)
+             (code-list hold-rules)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Sale / repair-order accounts</h2>\n"
+     "    <p class=\"muted\">The store's own account directory "
+     "(<code>motorcycleops.store/all-accounts</code>). A proposal may not commit "
+     "&mdash; or even escalate to a human &mdash; unless the governor re-derives "
+     "<code>:registered?</code> AND <code>:verified?</code> from this directory. "
+     "The proposal's own claim about its account is never trusted.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Account</th><th>Name</th><th>Registered?</th><th>Verified?</th>"
+     "<th>Committed</th><th>Held</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial account-row ledger) (store/all-accounts db))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "    <p class=\"muted\">The ledger below also references <code>account-99</code>, which is "
+     "deliberately <strong>absent</strong> from this directory: it is the unregistered-account "
+     "probe (the same one <code>motorcycleops.sim</code> uses) that shows the "
+     "<code>:account-unverified</code> HARD check firing on a genuinely unknown account.</p>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Actor run timeline</h2>\n"
+     "    <p class=\"muted\">Each row is one graph run "
+     "(<code>intake &rarr; advise &rarr; govern &rarr; decide &rarr; commit | hold | approval</code>). "
+     "The governor column is the governor's own verdict; the final column is what the rollout "
+     "phase gate did with it. The two disagree on purpose &mdash; a phase gate can only add "
+     "caution, never remove it.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Thread</th><th>Phase</th><th>Requested op</th><th>Account</th>"
+     "<th>Advisor confidence</th><th>Governor</th><th>Human</th><th>Final</th><th>Scenario</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map run-row runs)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Governor configuration</h2>\n"
+     "    <p class=\"muted\">Read directly off <code>motorcycleops.governor</code>'s public vars. "
+     "All three HARD checks (account unverified, effect not <code>:propose</code>, scope "
+     "exclusion) are permanent and un-overridable &mdash; no human approval can release them.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Setting</th><th>Value</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (governor-config-rows)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Rollout phase gate</h2>\n"
+     "    <p class=\"muted\">Derived from <code>motorcycleops.phase/phases</code>. Note that "
+     "<code>:flag-safety-concern</code> is absent from every phase's auto-commit set, including "
+     "phase 3 &mdash; a permanent structural fact, not a milestone still to come. The governor's "
+     "own <code>always-escalate-ops</code> enforces the same invariant independently.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>Phase</th><th>Label</th><th>May write</th><th>May auto-commit when clean</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map (partial phase-row phase/default-phase) (sort-by key phase/phases))) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Audit ledger (this run)</h2>\n"
+     "    <p class=\"muted\">The append-only decision-fact log "
+     "(<code>motorcycleops.store/ledger</code>). Every &ldquo;detail&rdquo; on a held row is the "
+     "governor's own violation text. Escalation requests are not written here &mdash; only "
+     "outcomes are (see the run timeline above for the human step).</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>#</th><th>Fact</th><th>Op</th><th>Account</th><th>Basis</th><th>Detail</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map-indexed (fn [i f] (ledger-row (inc i) f)) ledger)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "  <section class=\"card\">\n"
+     "    <h2>Committed service log</h2>\n"
+     "    <p class=\"muted\">The SSoT records that actually landed "
+     "(<code>motorcycleops.store/service-log</code>). The approver column is the "
+     "<code>:approved-by</code> the operation actor put on the record's <code>:payload</code> when "
+     "a human resumed the paused run; blank means the phase gate allowed a supervised auto-commit. "
+     "This is read back <em>out of the store</em>, not off the run result: "
+     "<code>MemStore/commit-record!</code> appends the whole record, so the attribution genuinely "
+     "reaches the SSoT rather than being reconstructed for display.</p>\n"
+     "    <table>\n"
+     "      <thead><tr><th>#</th><th>Op</th><th>Account</th><th>Committed value</th><th>Approved by</th></tr></thead>\n"
+     "      <tbody>\n"
+     (str/join "\n" (map-indexed (fn [i r] (service-row (inc i) r)) svc)) "\n"
+     "      </tbody>\n"
+     "    </table>\n"
+     "  </section>\n"
+
+     "</main>\n"
+     "<footer>\n"
+     "  <p>cloud-itonami-isic-4540 &middot; ISIC Rev.5 4540 &mdash; sale, maintenance and repair "
+     "of motorcycles and related parts and accessories. This actor coordinates the back office "
+     "around a roadworthiness-clearance decision; it never makes one.</p>\n"
+     "</footer>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as result} (run-demo!)
+        hs (filterv #(= :governor-hold (:t %)) (store/ledger db))]
+    (when (empty? hs)
+      (throw (ex-info "no :governor-hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count (store/ledger db))})))
+    (let [f (java.io.File. ^String out)]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (render result)))
+    (println "wrote" out
+             (str "(" (count runs) " actor runs, "
+                  (count (store/ledger db)) " ledger facts, "
+                  (count hs) " HARD governor holds, "
+                  (count (store/service-log db)) " committed service records)"))))
