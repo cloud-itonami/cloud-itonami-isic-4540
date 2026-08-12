@@ -275,15 +275,27 @@
     ok? "<span class=\"ok\">clean</span>"
     :else (str "<span class=\"muted\">confidence " (esc confidence) "</span>")))
 
-(defn- human-cell [audit]
+(defn- human-cell
+  "The human step, plus WHY a human was asked at all. The reason is the
+  `:reason` the actor's own `:decide` node put on its
+  `:approval-requested` fact -- `:phase-approval` when the rollout
+  phase gate demanded a human even though the governor was clean,
+  `:always-escalate`/`:low-confidence` when the governor itself did.
+  It is read off the run's audit, never inferred here: this is the
+  only place the phase gate's escalate reason is visible, since the
+  ledger records outcomes and not escalation requests."
+  [audit]
   (let [granted  (some #(when (= :approval-granted (:t %)) %) audit)
         rejected (some #(when (= :approval-rejected (:t %)) %) audit)
-        asked    (some #(when (= :approval-requested (:t %)) %) audit)]
+        asked    (some #(when (= :approval-requested (:t %)) %) audit)
+        why      (when-let [r (:reason asked)]
+                   (str " <span class=\"muted\">&middot; asked because <code>"
+                        (esc (nm r)) "</code></span>"))]
     (cond
       granted  (str "<span class=\"ok\">approved</span> by <code>"
-                    (esc (:by granted)) "</code>")
-      rejected "<span class=\"critical\">rejected</span>"
-      asked    "<span class=\"warn\">awaiting approval</span>"
+                    (esc (:by granted)) "</code>" why)
+      rejected (str "<span class=\"critical\">rejected</span>" why)
+      asked    (str "<span class=\"warn\">awaiting approval</span>" why)
       :else    dash)))
 
 (defn- final-cell [disposition audit]
@@ -469,8 +481,11 @@
      "    <h2>Committed service log</h2>\n"
      "    <p class=\"muted\">The SSoT records that actually landed "
      "(<code>motorcycleops.store/service-log</code>). The approver column is the "
-     "<code>:approved-by</code> the operation actor put on the record's payload when a human "
-     "resumed the paused run; blank means the phase gate allowed a supervised auto-commit.</p>\n"
+     "<code>:approved-by</code> the operation actor put on the record's <code>:payload</code> when "
+     "a human resumed the paused run; blank means the phase gate allowed a supervised auto-commit. "
+     "This is read back <em>out of the store</em>, not off the run result: "
+     "<code>MemStore/commit-record!</code> appends the whole record, so the attribution genuinely "
+     "reaches the SSoT rather than being reconstructed for display.</p>\n"
      "    <table>\n"
      "      <thead><tr><th>#</th><th>Op</th><th>Account</th><th>Committed value</th><th>Approved by</th></tr></thead>\n"
      "      <tbody>\n"
