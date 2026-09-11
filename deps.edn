@@ -19,7 +19,7 @@
          io.github.kotoba-lang/langchain
          {:local/root "../../kotoba-lang/langchain"}}}
   :run {:main-opts ["-m" "motorcycleops.sim"]}
-  ;; clojure -M:dev:render-html [out-file]
+  ;; kbb -M:dev:render-html [out-file]
   ;;   -> docs/samples/operator-console.html を REAL actor 実行から再生成する
   ;;      (flagship checklist item 2)。手書き HTML は禁止 -- ページ上の数値・
   ;;      id・処分はすべて operation -> governor -> store の実行結果。

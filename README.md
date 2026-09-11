@@ -75,9 +75,9 @@ See [`docs/business-model.md`](docs/business-model.md) and
 ## Development
 
 ```bash
-clojure -M:test
-clojure -M:lint
-clojure -M:run
+kbb -M:test
+kbb -M:lint
+kbb -M:run
 ```
 
 ## License
