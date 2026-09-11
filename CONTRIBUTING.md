@@ -9,8 +9,8 @@ The capability layer lives in `kotoba-lang/robotics` and
 operator contracts.
 
 ```bash
-clojure -M:test
-clojure -M:lint
+kbb -M:test
+kbb -M:lint
 ```
 
 ## Rules
