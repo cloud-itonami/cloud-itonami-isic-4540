@@ -1,0 +1,31 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README: sale, maintenance and repair of motorcycles (ISIC 4540); the
+;; workshop work is done by robots under kotoba-lang/robotics. The physical
+;; work: a workshop arm lifting a motorcycle wheel onto the tyre machine,
+;; and draining a fuel tank through its tap before the tank is removed for
+;; repair.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-4540"
+ :cases
+ [{:id :lift-wheel-to-tyre-machine
+   :kind :manipulator
+   :procedure "workshop arm lifts a removed motorcycle wheel (rim, tyre, disc) from the floor stand onto the tyre-changing machine"
+   :params {:l1-m 0.55 :l2-m 0.45 :m1-kg 7.0 :m2-kg 4.0
+            :from [0.65 0.05] :to [0.30 0.60] :duration-s 2.0 :steps 400}
+   :sweep {:param :payload-kg :values [5.0 8.0 12.0 16.0 20.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 150.0 :basis "estimate: continuous shoulder torque of a ~12 kg-payload workshop arm"}
+   :boundary {:lo 1.0 :hi 60.0}}
+  {:id :drain-fuel-tank
+   :kind :tank-drain
+   :procedure "before a fuel tank is removed for repair, the robot drains it through the tap hose into an approved can, from 0.15 m of fuel down to 0.01 m"
+   :params {:tank-area-m2 0.05 :h0-m 0.15 :h-target-m 0.01 :cd 0.62 :dt-s 0.1 :max-time-s 7200.0}
+   :sweep {:param :orifice-area-m2 :values [1.26e-5 2.01e-5 2.83e-5 5.03e-5 7.85e-5]}
+   :quantity :time-to-target-s
+   :limit {:max 600.0 :basis "estimate: 10 minutes allotted to draining in the tank-removal job"}
+   :boundary {:lo 5.0e-6 :hi 2.0e-4}}]}
