@@ -1,6 +1,6 @@
 (ns motorcycleops.advisor-test
   "Unit tests of `motorcycleops.advisor` proposal generation."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [motorcycleops.advisor :as adv]
             [motorcycleops.store :as store]))
 

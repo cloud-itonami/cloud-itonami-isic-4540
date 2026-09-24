@@ -1,6 +1,6 @@
 (ns motorcycleops.store-contract-test
   "Contract tests for `motorcycleops.store/Store` protocol."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [motorcycleops.store :as store]))
 
 (deftest mem-store-account-lookup
