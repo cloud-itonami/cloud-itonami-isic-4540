@@ -2,7 +2,7 @@
   "Pure unit tests of `motorcycleops.governor/check` against hand-built
   proposals -- the fast, focused complement to `governor-contract-test`'s
   full-graph integration coverage."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [motorcycleops.advisor :as advisor]
             [motorcycleops.governor :as gov]
             [motorcycleops.store :as store]))

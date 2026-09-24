@@ -1,6 +1,6 @@
 (ns motorcycleops.phase-test
   "Unit tests of `motorcycleops.phase` rollout logic."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [motorcycleops.phase :as phase]))
 
 (def clean-verdict {:hard? false :escalate? false})
