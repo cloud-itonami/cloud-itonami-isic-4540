@@ -21,7 +21,7 @@
         {:git/sha "a332a770a0d2b5193f81b54483bb954fb29ef8d7"}
         ;; デジタル庁デザインシステム(DADS) -- build-time operator console の
         ;; スタイル。`jp-go-dds.skin/dds+skin` が vendored dds.css + 互換
-        ;; スキンを 1 本の CSS 文字列で返す(CLAUDE.md: 新規 UI の基盤は DADS)。
+        ;; スキンを 1 本の CSS 文字列で返す(AGENTS.md: 新規 UI の基盤は DADS)。
         io.github.kotoba-lang/jp-go-digital-design-system
         {:git/url "https://github.com/kotoba-lang/jp-go-digital-design-system"
          :git/sha "83db99546eabc53613ae826ea41d1533a3c574af"}}
